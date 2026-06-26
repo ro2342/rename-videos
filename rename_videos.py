@@ -3,7 +3,11 @@
 rename_videos.py — renomeia vídeos automaticamente com data + slug gerado por IA.
 
 Fluxo por arquivo:
-  1. Extrai a data do nome do arquivo (suporte a DJI: DJI_YYYYMMDDHHMMSS_...)
+  1. Descobre a data de gravação (em ordem de confiabilidade):
+       a) metadata do arquivo via ffprobe (creation_time) — funciona com
+          qualquer câmera: DJI, GoPro, Sony, Canon, celular, etc.
+       b) padrões conhecidos no nome do arquivo (DJI, Samsung, ISO, etc.)
+       c) data de modificação do arquivo (último recurso)
   2. Transcreve os primeiros N segundos com faster-whisper (local, sem API)
   3. Manda o transcript para a IA escolhida e pede um slug descritivo
   4. Renomeia para DD-MM-YYYY-slug-descritivo.ext
@@ -41,8 +45,73 @@ except ImportError:
 
 VIDEO_EXTENSIONS = {".mov", ".mp4", ".avi", ".mkv", ".mts", ".m2ts", ".mxf", ".wmv"}
 
-# DJI naming: DJI_YYYYMMDDHHMMSS_NNNN_X.ext
-_DJI_RE = re.compile(r"DJI_(\d{4})(\d{2})(\d{2})\d+", re.IGNORECASE)
+# ---------------------------------------------------------------------------
+# Extração de data — três camadas em ordem decrescente de confiabilidade
+# ---------------------------------------------------------------------------
+
+# Padrões de nome de arquivo com data embutida.
+# Usados apenas quando o metadata do container não tem creation_time.
+# Cada tupla: (regex, índices dos grupos year/month/day)
+_FILENAME_PATTERNS: list[tuple[re.Pattern, tuple[int, int, int]]] = [
+    # DJI:      DJI_20260501134401_0039_D.ext
+    (re.compile(r"DJI_(\d{4})(\d{2})(\d{2})\d+", re.IGNORECASE), (1, 2, 3)),
+    # Samsung/Android:  VID_20260501_134401.ext
+    (re.compile(r"VID_(\d{4})(\d{2})(\d{2})_\d+", re.IGNORECASE), (1, 2, 3)),
+    # WhatsApp:  VID-20260501-WA0001.ext
+    (re.compile(r"VID-(\d{4})(\d{2})(\d{2})-", re.IGNORECASE), (1, 2, 3)),
+    # OBS / screen capture:  2026-05-01 13-44-01.mkv  ou  2026-05-01_13-44.ext
+    (re.compile(r"(\d{4})-(\d{2})-(\d{2})[ _T\-]"), (1, 2, 3)),
+    # GoPro com data:  GOPR20260501.ext  (raro, mas existe)
+    (re.compile(r"GOPR(\d{4})(\d{2})(\d{2})", re.IGNORECASE), (1, 2, 3)),
+    # Genérico YYYYMMDD em qualquer posição do nome
+    (re.compile(r"(\d{4})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])"), (1, 2, 3)),
+]
+
+
+def _validate_date(year: str, month: str, day: str) -> bool:
+    y, m, d = int(year), int(month), int(day)
+    return 2000 <= y <= 2099 and 1 <= m <= 12 and 1 <= d <= 31
+
+
+def _date_from_ffprobe(path: Path) -> str | None:
+    """Lê creation_time do container via ffprobe. Funciona com qualquer câmera."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "0",
+             "-show_entries", "format_tags=creation_time",
+             "-of", "json", str(path)],
+            stderr=subprocess.DEVNULL,
+        ).decode()
+        ct = json.loads(out).get("format", {}).get("tags", {}).get("creation_time", "")
+        if not ct:
+            return None
+        # Formato: "2026-05-01T13:44:01.000000Z"
+        dt = datetime.fromisoformat(ct.rstrip("Z").split(".")[0])
+        return dt.strftime("%d-%m-%Y")
+    except Exception:
+        return None
+
+
+def _date_from_filename(stem: str) -> str | None:
+    """Tenta extrair data do nome do arquivo usando padrões conhecidos."""
+    for pattern, (yi, mi, di) in _FILENAME_PATTERNS:
+        m = pattern.search(stem)
+        if m and _validate_date(m.group(yi), m.group(mi), m.group(di)):
+            return f"{m.group(di)}-{m.group(mi)}-{m.group(yi)}"
+    return None
+
+
+def parse_date(path: Path) -> tuple[str, str]:
+    """Retorna (data DD-MM-YYYY, fonte) para o vídeo."""
+    d = _date_from_ffprobe(path)
+    if d:
+        return d, "metadata"
+    d = _date_from_filename(path.stem)
+    if d:
+        return d, "nome"
+    d = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d-%m-%Y")
+    return d, "mtime"
+
 
 SLUG_PROMPT = """\
 Você receberá a transcrição de um trecho de vídeo. Gere um slug descritivo \
@@ -71,16 +140,6 @@ def slugify(text: str) -> str:
     text = re.sub(r"[^a-z0-9\s-]", "", text)
     text = re.sub(r"[\s-]+", "-", text).strip("-")
     return text or "video"
-
-
-def parse_date(path: Path) -> str:
-    """Retorna DD-MM-YYYY extraído do nome do arquivo ou da data de modificação."""
-    m = _DJI_RE.match(path.stem)
-    if m:
-        year, month, day = m.group(1), m.group(2), m.group(3)
-        return f"{day}-{month}-{year}"
-    mtime = datetime.fromtimestamp(path.stat().st_mtime)
-    return mtime.strftime("%d-%m-%Y")
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +266,8 @@ def main() -> None:
     for i, video in enumerate(videos, 1):
         print(f"[{i}/{len(videos)}] {video.name}")
 
-        date_str = parse_date(video)
-        print(f"  data   : {date_str}")
+        date_str, date_src = parse_date(video)
+        print(f"  data   : {date_str}  (via {date_src})")
 
         print(f"  whisper: transcrevendo primeiros {args.max_seconds:.0f}s...")
         transcript = transcribe(video, args.whisper_model, args.max_seconds)
