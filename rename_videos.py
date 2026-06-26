@@ -228,7 +228,7 @@ def main() -> None:
         description="Renomeia vídeos com data + slug gerado por IA via transcrição.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("path", help="Diretório ou arquivo de vídeo")
+    ap.add_argument("path", nargs="?", default=".", help="Diretório ou arquivo de vídeo (padrão: pasta atual)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Mostra renomes propostos sem executar")
     ap.add_argument("--yes", "-y", action="store_true",
