@@ -165,22 +165,25 @@ def transcribe(video: Path, model: "WhisperModel", max_seconds: float) -> str:
     """Transcreve até max_seconds do vídeo. Retorna o texto completo."""
     from tqdm import tqdm
 
-    segments, _ = model.transcribe(str(video), word_timestamps=False)
-
-    parts: list[str] = []
-    with tqdm(total=max_seconds, unit="s", unit_scale=False,
-              bar_format="  [{bar:30}] {n:.0f}/{total:.0f}s",
-              leave=False, ncols=60) as bar:
-        last = 0.0
-        for seg in segments:
-            parts.append(seg.text.strip())
-            bar.update(min(seg.end, max_seconds) - last)
-            last = seg.end
-            if seg.end >= max_seconds:
-                break
-        bar.update(max_seconds - last)  # fecha a barra em 100%
-
-    return " ".join(parts).strip()
+    try:
+        segments, _ = model.transcribe(str(video), word_timestamps=False)
+        parts: list[str] = []
+        with tqdm(total=max_seconds, unit="s", unit_scale=False,
+                  bar_format="  [{bar:30}] {n:.0f}/{total:.0f}s",
+                  leave=False, ncols=60) as bar:
+            last = 0.0
+            for seg in segments:
+                parts.append(seg.text.strip())
+                bar.update(min(seg.end, max_seconds) - last)
+                last = seg.end
+                if seg.end >= max_seconds:
+                    break
+            bar.update(max_seconds - last)
+        return " ".join(parts).strip()
+    except (IndexError, Exception) as exc:
+        # IndexError ocorre quando o vídeo não tem stream de áudio
+        print(f"  aviso  : sem áudio ou erro ao decodificar ({exc.__class__.__name__})")
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +240,14 @@ def generate_slug(transcript: str, provider: str, ollama_model: str, ai_cmd: str
     raise ValueError(f"Provider desconhecido: {provider}")
 
 
+def _check_provider_deps(provider: str) -> None:
+    if provider == "anthropic":
+        try:
+            import anthropic  # noqa: F401
+        except ImportError:
+            sys.exit("Erro: pacote 'anthropic' não instalado. Execute: pip install anthropic")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -262,6 +273,8 @@ def main() -> None:
                     help="Modelo faster-whisper (padrão: large-v3-turbo)")
     ap.add_argument("--max-seconds", type=float, default=90.0,
                     help="Segundos máximos de áudio a transcrever por arquivo (padrão: 90)")
+    ap.add_argument("--cache-dir", default=None,
+                    help="Pasta para cache de transcrições (padrão: .rename_cache/ ao lado dos vídeos)")
     args = ap.parse_args()
 
     target = Path(args.path)
@@ -276,6 +289,12 @@ def main() -> None:
         print("Nenhum vídeo encontrado.")
         return
 
+    video_dir = target if target.is_dir() else target.parent
+    cache_dir = Path(args.cache_dir) if args.cache_dir else video_dir / ".rename_cache"
+    cache_dir.mkdir(exist_ok=True)
+
+    _check_provider_deps(args.provider)
+
     print(f"{len(videos)} vídeo(s) encontrado(s) | IA: {args.provider} | "
           f"whisper: {args.whisper_model} | max: {args.max_seconds:.0f}s\n")
 
@@ -289,8 +308,15 @@ def main() -> None:
         date_str, date_src = parse_date(video)
         print(f"  data   : {date_str}  (via {date_src})")
 
-        print(f"  whisper: transcrevendo primeiros {args.max_seconds:.0f}s...")
-        transcript = transcribe(video, whisper_model, args.max_seconds)
+        cache_file = cache_dir / f"{video.stem}.txt"
+        if cache_file.exists():
+            transcript = cache_file.read_text(encoding="utf-8")
+            print(f"  whisper: usando cache ({cache_file.name})")
+        else:
+            print(f"  whisper: transcrevendo primeiros {args.max_seconds:.0f}s...")
+            transcript = transcribe(video, whisper_model, args.max_seconds)
+            cache_file.write_text(transcript, encoding="utf-8")
+
         preview = (transcript[:90] + "...") if len(transcript) > 90 else transcript
         print(f"  texto  : {preview or '(vazio)'}")
 
