@@ -146,21 +146,39 @@ def slugify(text: str) -> str:
 # Transcrição (faster-whisper, local, sem API)
 # ---------------------------------------------------------------------------
 
-def transcribe(video: Path, model_name: str, max_seconds: float) -> str:
-    """Transcreve até max_seconds do vídeo. Retorna o texto completo."""
+def _load_whisper(model_name: str) -> "WhisperModel":
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         sys.exit("Erro: faster-whisper não instalado. Execute: pip install faster-whisper")
 
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    import ctranslate2
+    if "cuda" in ctranslate2.get_supported_compute_types("cuda"):
+        device, compute = "cuda", "float16"
+    else:
+        device, compute = "cpu", "int8"
+    print(f"  whisper: carregando {model_name} ({device})...")
+    return WhisperModel(model_name, device=device, compute_type=compute)
+
+
+def transcribe(video: Path, model: "WhisperModel", max_seconds: float) -> str:
+    """Transcreve até max_seconds do vídeo. Retorna o texto completo."""
+    from tqdm import tqdm
+
     segments, _ = model.transcribe(str(video), word_timestamps=False)
 
     parts: list[str] = []
-    for seg in segments:
-        parts.append(seg.text.strip())
-        if seg.end >= max_seconds:
-            break
+    with tqdm(total=max_seconds, unit="s", unit_scale=False,
+              bar_format="  [{bar:30}] {n:.0f}/{total:.0f}s",
+              leave=False, ncols=60) as bar:
+        last = 0.0
+        for seg in segments:
+            parts.append(seg.text.strip())
+            bar.update(min(seg.end, max_seconds) - last)
+            last = seg.end
+            if seg.end >= max_seconds:
+                break
+        bar.update(max_seconds - last)  # fecha a barra em 100%
 
     return " ".join(parts).strip()
 
@@ -261,6 +279,8 @@ def main() -> None:
     print(f"{len(videos)} vídeo(s) encontrado(s) | IA: {args.provider} | "
           f"whisper: {args.whisper_model} | max: {args.max_seconds:.0f}s\n")
 
+    whisper_model = _load_whisper(args.whisper_model)
+
     renames: list[tuple[Path, Path]] = []
 
     for i, video in enumerate(videos, 1):
@@ -270,7 +290,7 @@ def main() -> None:
         print(f"  data   : {date_str}  (via {date_src})")
 
         print(f"  whisper: transcrevendo primeiros {args.max_seconds:.0f}s...")
-        transcript = transcribe(video, args.whisper_model, args.max_seconds)
+        transcript = transcribe(video, whisper_model, args.max_seconds)
         preview = (transcript[:90] + "...") if len(transcript) > 90 else transcript
         print(f"  texto  : {preview or '(vazio)'}")
 
