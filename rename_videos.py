@@ -275,24 +275,43 @@ def _slug_cmd(transcript: str, cmd: str) -> str:
     return slugify(result.stdout.strip())
 
 
+def _trim_hallucinations(transcript: str) -> str:
+    """Remove a cauda de alucinações do whisper (frases repetidas no final do transcript)."""
+    # Divide em frases curtas usando pontuação e quebras de linha
+    chunks = [s.strip() for s in re.split(r'[.!?,\n]', transcript) if len(s.strip()) > 5]
+    if len(chunks) < 4:
+        return transcript
+    # Percorre de trás para frente e apara onde a repetição começa
+    seen: set[str] = set()
+    cutoff = len(chunks)
+    for j in range(len(chunks) - 1, -1, -1):
+        low = chunks[j].lower()
+        if low in seen:
+            cutoff = j
+        seen.add(low)
+    good = chunks[:cutoff] if cutoff > 0 else chunks[:len(chunks) // 2]
+    return ". ".join(good)
+
+
 def _is_broll(transcript: str) -> bool:
-    """Detecta b-roll/sem fala por repetição excessiva — sinal de alucinação do whisper."""
+    """Detecta b-roll/sem fala verificando apenas os primeiros 100 palavras.
+
+    Checa só o início — alucinações do whisper ficam no final do transcript.
+    Thresholds conservadores para não flagrar fala real em português
+    (que naturalmente repete "e aí", "de", "que", "vai" com frequência).
+    """
     if not transcript:
         return True
-    words = transcript.lower().split()
-    if len(words) < 4:
+    words = transcript.lower().split()[:100]
+    if len(words) < 6:
         return True
-    # Proporção baixa de palavras únicas (ex: "thank you thank you thank you")
-    if len(set(words)) / len(words) < 0.55:
+    # Ratio muito baixo = alucinação extrema (ex: "thank you thank you thank you")
+    if len(set(words)) / len(words) < 0.30:
         return True
-    # Bigrama dominante muito repetido (ex: "a cidade no brasil a cidade no brasil")
-    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
-    top_bi = max(set(bigrams), key=bigrams.count)
-    if bigrams.count(top_bi) >= 2 and bigrams.count(top_bi) / len(bigrams) > 0.35:
-        return True
-    # Frases repetidas (ex: "The car is on the car. The car is on the car.")
-    sentences = [s.strip() for s in re.split(r'[.!?]', transcript.lower()) if len(s.strip()) > 8]
-    if len(sentences) >= 3 and len(set(sentences)) / len(sentences) < 0.65:
+    # Trigrama dominante = frase repetida (ex: "a cidade no brasil a cidade no brasil")
+    trigrams = [" ".join(words[i:i+3]) for i in range(len(words) - 2)]
+    top = max(set(trigrams), key=trigrams.count)
+    if trigrams.count(top) / len(trigrams) > 0.25:
         return True
     return False
 
@@ -300,6 +319,7 @@ def _is_broll(transcript: str) -> bool:
 def generate_slug(transcript: str, provider: str, ollama_model: str, ai_cmd: str) -> str:
     if _is_broll(transcript):
         return "broll"
+    transcript = _trim_hallucinations(transcript)
     if provider == "anthropic":
         return _slug_anthropic(transcript)
     if provider == "ollama":
