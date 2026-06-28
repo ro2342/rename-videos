@@ -163,27 +163,47 @@ def _load_whisper(model_name: str) -> "WhisperModel":
 
 def transcribe(video: Path, model: "WhisperModel", max_seconds: float) -> str:
     """Transcreve até max_seconds do vídeo. Retorna o texto completo."""
-    from tqdm import tqdm
+    import threading
 
-    try:
-        segments, _ = model.transcribe(str(video), word_timestamps=False)
-        parts: list[str] = []
-        with tqdm(total=max_seconds, unit="s", unit_scale=False,
-                  bar_format="  [{bar:30}] {n:.0f}/{total:.0f}s",
-                  leave=False, ncols=60) as bar:
-            last = 0.0
-            for seg in segments:
+    parts: list[str] = []
+    pos = [0.0]       # posição atual em segundos (atualizada pelo worker)
+    err: list[Exception | None] = [None]
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            segs, _ = model.transcribe(str(video), word_timestamps=False)
+            for seg in segs:
                 parts.append(seg.text.strip())
-                bar.update(min(seg.end, max_seconds) - last)
-                last = seg.end
+                pos[0] = min(seg.end, max_seconds)
                 if seg.end >= max_seconds:
                     break
-            bar.update(max_seconds - last)
-        return " ".join(parts).strip()
-    except (IndexError, Exception) as exc:
-        # IndexError ocorre quando o vídeo não tem stream de áudio
-        print(f"  aviso  : sem áudio ou erro ao decodificar ({exc.__class__.__name__})")
-        return ""
+        except Exception as exc:
+            err[0] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    # barra de progresso no thread principal — atualiza a cada 120ms
+    spinner = ['⠋', '⠙', '⠸', '⠼', '⠴', '⠦', '⠇', '⠏']
+    i = 0
+    while not done.wait(0.12):
+        p = pos[0]
+        filled = int(p / max_seconds * 28)
+        bar = '█' * filled + '░' * (28 - filled)
+        print(f"\r  [{bar}] {p:.0f}/{max_seconds:.0f}s {spinner[i % len(spinner)]}",
+              end="", flush=True)
+        i += 1
+    print(f"\r  [{'█' * 28}] {max_seconds:.0f}/{max_seconds:.0f}s   ", flush=True)
+
+    if err[0] is not None:
+        if isinstance(err[0], IndexError):
+            print("  aviso  : sem áudio ou erro ao decodificar (IndexError)")
+            return ""
+        raise err[0]
+
+    return " ".join(parts).strip()
 
 
 # ---------------------------------------------------------------------------
