@@ -149,7 +149,7 @@ def slugify(text: str) -> str:
 # Transcrição (faster-whisper, local, sem API)
 # ---------------------------------------------------------------------------
 
-def _load_whisper(model_name: str) -> "WhisperModel":
+def _load_whisper(model_name: str, force_cpu: bool = False) -> "WhisperModel":
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -158,7 +158,7 @@ def _load_whisper(model_name: str) -> "WhisperModel":
     import ctranslate2, threading
 
     try:
-        device, compute = ("cuda", "float16") if ctranslate2.get_cuda_device_count() > 0 else ("cpu", "int8")
+        device, compute = ("cuda", "float16") if (not force_cpu and ctranslate2.get_cuda_device_count() > 0) else ("cpu", "int8")
     except Exception:
         device, compute = "cpu", "int8"
 
@@ -182,6 +182,9 @@ def _load_whisper(model_name: str) -> "WhisperModel":
     return holder[0]
 
 
+_CUDA_FAIL = "__cuda_lib_missing__"
+
+
 def transcribe(video: Path, model: "WhisperModel", max_seconds: float) -> str:
     """Transcreve até max_seconds do vídeo. Retorna o texto completo."""
     import threading
@@ -199,6 +202,11 @@ def transcribe(video: Path, model: "WhisperModel", max_seconds: float) -> str:
                 pos[0] = min(seg.end, max_seconds)
                 if seg.end >= max_seconds:
                     break
+        except RuntimeError as exc:
+            if any(lib in str(exc) for lib in ("libcublas", "libcuda", "CUDA error")):
+                err[0] = RuntimeError(_CUDA_FAIL)
+            else:
+                err[0] = exc
         except Exception as exc:
             err[0] = exc
         finally:
@@ -222,7 +230,7 @@ def transcribe(video: Path, model: "WhisperModel", max_seconds: float) -> str:
         if isinstance(err[0], IndexError):
             print("  aviso  : sem áudio ou erro ao decodificar (IndexError)")
             return ""
-        raise err[0]
+        raise err[0]  # RuntimeError(_CUDA_FAIL) sobe para main() tratar
 
     return " ".join(parts).strip()
 
@@ -377,7 +385,14 @@ def main() -> None:
             print(f"  whisper: usando cache ({cache_file.name})")
         else:
             print(f"  whisper: transcrevendo primeiros {args.max_seconds:.0f}s...")
-            transcript = transcribe(video, whisper_model, args.max_seconds)
+            try:
+                transcript = transcribe(video, whisper_model, args.max_seconds)
+            except RuntimeError as exc:
+                if _CUDA_FAIL not in str(exc):
+                    raise
+                print("  aviso  : CUDA indisponível (libcublas não encontrado), voltando para CPU...")
+                whisper_model = _load_whisper(args.whisper_model, force_cpu=True)
+                transcript = transcribe(video, whisper_model, args.max_seconds)
             cache_file.write_text(transcript, encoding="utf-8")
 
         preview = (transcript[:90] + "...") if len(transcript) > 90 else transcript
