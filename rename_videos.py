@@ -114,15 +114,18 @@ def parse_date(path: Path) -> tuple[str, str]:
 
 
 SLUG_PROMPT = """\
-Você receberá a transcrição de um trecho de vídeo. Gere um slug descritivo \
-em português brasileiro com 3 a 5 palavras, em kebab-case (sem acentos, \
-tudo minúsculo, palavras separadas por hífen). Responda APENAS com o slug.
+Você receberá a transcrição de um trecho de vlog em português brasileiro.
+Gere um slug com 4 a 6 palavras que capture o tema principal ou o momento \
+mais marcante. Use kebab-case (sem acentos, tudo minúsculo, palavras \
+separadas por hífen). Seja específico — evite generalizações como \
+"falando-sobre-algo" ou "video-do-dia". Responda APENAS com o slug.
 
 Exemplos válidos:
-  falando-sobre-edicao-podcast
-  dicas-para-editar-video
-  review-camera-dji-osmo
-  conversa-sobre-marketing-digital
+  chegou-minha-nova-camera-dji-osmo
+  cortei-o-cabelo-pela-primeira-vez
+  dicas-de-edicao-que-uso-todo-dia
+  comprando-roupa-nova-com-minha-mae
+  mudei-de-cidade-e-to-nervosa
 
 Transcrição:
 {transcript}"""
@@ -152,13 +155,31 @@ def _load_whisper(model_name: str) -> "WhisperModel":
     except ImportError:
         sys.exit("Erro: faster-whisper não instalado. Execute: pip install faster-whisper")
 
-    import ctranslate2
-    if "cuda" in ctranslate2.get_supported_compute_types("cuda"):
-        device, compute = "cuda", "float16"
-    else:
+    import ctranslate2, threading
+
+    try:
+        device, compute = ("cuda", "float16") if ctranslate2.get_cuda_device_count() > 0 else ("cpu", "int8")
+    except Exception:
         device, compute = "cpu", "int8"
-    print(f"  whisper: carregando {model_name} ({device})...")
-    return WhisperModel(model_name, device=device, compute_type=compute)
+
+    holder: list = [None]
+    done = threading.Event()
+
+    def _load():
+        holder[0] = WhisperModel(model_name, device=device, compute_type=compute)
+        done.set()
+
+    threading.Thread(target=_load, daemon=True).start()
+
+    spinner = ['⠋', '⠙', '⠸', '⠼', '⠴', '⠦', '⠇', '⠏']
+    i = 0
+    while not done.wait(0.12):
+        print(f"\r  whisper: carregando {model_name} ({device})... {spinner[i % len(spinner)]}",
+              end="", flush=True)
+        i += 1
+    print(f"\r  whisper: {model_name} ({device}) pronto                    ")
+
+    return holder[0]
 
 
 def transcribe(video: Path, model: "WhisperModel", max_seconds: float) -> str:
@@ -253,13 +274,19 @@ def _is_broll(transcript: str) -> bool:
     words = transcript.lower().split()
     if len(words) < 4:
         return True
-    # Muitas palavras repetidas = alucinação (ex: "thank you thank you thank you")
+    # Proporção baixa de palavras únicas (ex: "thank you thank you thank you")
     if len(set(words)) / len(words) < 0.55:
         return True
-    # Bigrama dominante repetido = alucinação (ex: "a cidade no brasil a cidade no brasil")
+    # Bigrama dominante muito repetido (ex: "a cidade no brasil a cidade no brasil")
     bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
-    top = max(set(bigrams), key=bigrams.count)
-    return bigrams.count(top) >= 2 and bigrams.count(top) / len(bigrams) > 0.35
+    top_bi = max(set(bigrams), key=bigrams.count)
+    if bigrams.count(top_bi) >= 2 and bigrams.count(top_bi) / len(bigrams) > 0.35:
+        return True
+    # Frases repetidas (ex: "The car is on the car. The car is on the car.")
+    sentences = [s.strip() for s in re.split(r'[.!?]', transcript.lower()) if len(s.strip()) > 8]
+    if len(sentences) >= 3 and len(set(sentences)) / len(sentences) < 0.65:
+        return True
+    return False
 
 
 def generate_slug(transcript: str, provider: str, ollama_model: str, ai_cmd: str) -> str:
@@ -307,8 +334,8 @@ def main() -> None:
                     help='Comando CLI para IA, ex: "gemini -p" (lê stdin)')
     ap.add_argument("--whisper-model", default=os.getenv("WHISPER_MODEL", "large-v3-turbo"),
                     help="Modelo faster-whisper (padrão: large-v3-turbo)")
-    ap.add_argument("--max-seconds", type=float, default=90.0,
-                    help="Segundos máximos de áudio a transcrever por arquivo (padrão: 90)")
+    ap.add_argument("--max-seconds", type=float, default=180.0,
+                    help="Segundos máximos de áudio a transcrever por arquivo (padrão: 180)")
     ap.add_argument("--cache-dir", default=None,
                     help="Pasta para cache de transcrições (padrão: .rename_cache/ ao lado dos vídeos)")
     args = ap.parse_args()
