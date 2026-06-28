@@ -226,9 +226,25 @@ def _slug_cmd(transcript: str, cmd: str) -> str:
     return slugify(result.stdout.strip())
 
 
-def generate_slug(transcript: str, provider: str, ollama_model: str, ai_cmd: str) -> str:
+def _is_broll(transcript: str) -> bool:
+    """Detecta b-roll/sem fala por repetição excessiva — sinal de alucinação do whisper."""
     if not transcript:
-        return "sem-transcricao"
+        return True
+    words = transcript.lower().split()
+    if len(words) < 4:
+        return True
+    # Muitas palavras repetidas = alucinação (ex: "thank you thank you thank you")
+    if len(set(words)) / len(words) < 0.55:
+        return True
+    # Bigrama dominante repetido = alucinação (ex: "a cidade no brasil a cidade no brasil")
+    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+    top = max(set(bigrams), key=bigrams.count)
+    return bigrams.count(top) >= 2 and bigrams.count(top) / len(bigrams) > 0.35
+
+
+def generate_slug(transcript: str, provider: str, ollama_model: str, ai_cmd: str) -> str:
+    if _is_broll(transcript):
+        return "broll"
     if provider == "anthropic":
         return _slug_anthropic(transcript)
     if provider == "ollama":
@@ -318,9 +334,9 @@ def main() -> None:
             cache_file.write_text(transcript, encoding="utf-8")
 
         preview = (transcript[:90] + "...") if len(transcript) > 90 else transcript
-        print(f"  texto  : {preview or '(vazio)'}")
+        broll = _is_broll(transcript)
+        print(f"  texto  : {preview or '(vazio)'}{'  [b-roll]' if broll else ''}")
 
-        print(f"  ia     : gerando slug ({args.provider})...")
         try:
             slug = generate_slug(transcript, args.provider,
                                  args.ollama_model, args.ai_cmd)
